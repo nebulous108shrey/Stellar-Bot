@@ -36,7 +36,7 @@ except ValueError:
     raise SystemExit("GUILD_ID or HOMEWORK_CHANNEL_ID is not a valid number.")
 
 DATA_FILE = Path(__file__).with_name("bot_data.json")
-MODEL = "openai/gpt-oss-120b"
+MODEL = "qwen/qwen3.8-27b"
 VISION_MODEL = "qwen/qwen3.8-27b"  # Groq vision-capable model for uploaded worksheet images
 
 ai = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
@@ -355,35 +355,48 @@ def is_seen(kind, text):
 # ==================================================
 
 async def ask_ai(system_prompt, user_prompt):
-    """Call Groq with a fallback model and retry if a model returns no text."""
+    """Call currently supported Groq models, with settings that avoid empty reasoning-only replies."""
     if ai is None:
         raise RuntimeError(
             "GROQ_API_KEY is missing from .env. Add your API key to enable AI."
         )
 
-    # Keep a fast, broadly available fallback in case the primary model returns
-    # an empty completion or is temporarily unavailable.
-    models_to_try = [MODEL, "llama-3.1-8b-instant"]
+    # llama-3.1-8b-instant is retired for free/developer Groq accounts.
+    # Qwen with reasoning disabled is the primary model; GPT-OSS models are fallbacks.
+    models_to_try = [MODEL, "openai/gpt-oss-120b", "openai/gpt-oss-20b"]
     errors = []
+
     for model_name in models_to_try:
         try:
-            response = await ai.chat.completions.create(
-                model=model_name,
-                messages=[
+            request = {
+                "model": model_name,
+                "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=0.4,
-                max_completion_tokens=3000,
-            )
+                "temperature": 0.4,
+                "max_completion_tokens": 6000,
+            }
+
+            # Qwen supports disabling reasoning, leaving more tokens for the actual answer.
+            if model_name.startswith("qwen/"):
+                request["reasoning_effort"] = "none"
+            # GPT-OSS is a reasoning model; keep its reasoning budget low enough to leave room for content.
+            elif model_name.startswith("openai/gpt-oss-"):
+                request["reasoning_effort"] = "low"
+
+            response = await ai.chat.completions.create(**request)
             if not response.choices:
                 errors.append(f"{model_name}: no choices returned")
                 continue
-            message = response.choices[0].message
+
+            choice = response.choices[0]
+            message = choice.message
             content = message.content
             if isinstance(content, str) and content.strip():
                 return content.strip()
-            finish_reason = getattr(response.choices[0], "finish_reason", "unknown")
+
+            finish_reason = getattr(choice, "finish_reason", "unknown")
             reasoning = getattr(message, "reasoning", None)
             errors.append(
                 f"{model_name}: empty content (finish_reason={finish_reason}, "
@@ -391,9 +404,11 @@ async def ask_ai(system_prompt, user_prompt):
             )
         except Exception as error:
             errors.append(f"{model_name}: {type(error).__name__}: {error}")
-            continue
 
-    raise RuntimeError("All Groq models failed: " + " | ".join(errors))
+    # Log technical details for the host dashboard, but don't expose API internals in Discord.
+    detail = " | ".join(errors)
+    print(f"Groq AI request failed on all models: {detail}")
+    raise RuntimeError("All configured Groq models failed. Check the deploy logs for model/API details.")
 
 
 async def generate_fact():
