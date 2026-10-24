@@ -437,6 +437,30 @@ async def generate_fact():
     raise RuntimeError("Could not create an unused fact. Try again shortly.")
 
 
+def format_discord_explanation(text: str) -> str:
+    """Convert common LaTeX fragments to readable text because Discord embeds do not render math."""
+    text = str(text or "").strip()
+    # Remove display/inline math wrappers first.
+    text = re.sub(r"\$\$?", "", text)
+    text = re.sub(r"\\\[|\\\]|\\\(|\\\)", "", text)
+    # Convert common commands and fractions to readable plain-text notation.
+    text = re.sub(r"\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}", r"(\1)/(\2)", text)
+    text = re.sub(r"\\sqrt\s*\{([^{}]+)\}", r"sqrt(\1)", text)
+    text = re.sub(r"\\text\s*\{([^{}]*)\}", r"\1", text)
+    text = re.sub(r"\\mathrm\s*\{([^{}]*)\}", r"\1", text)
+    text = re.sub(r"\\cdot|\\times", "×", text)
+    text = re.sub(r"\\approx", "≈", text)
+    text = re.sub(r"\\pm", "±", text)
+    text = re.sub(r"\\div", "÷", text)
+    text = re.sub(r"\\,|\\;|\\!", " ", text)
+    # Remove leftover LaTeX braces and tidy whitespace.
+    text = text.replace("{", "").replace("}", "")
+    text = re.sub(r"\\(?:left|right)", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    return text.strip()
+
+
 async def generate_quiz(difficulty="easy", worded_problem=False):
     level_descriptions = {
         "easy": "Australian Year 10 level: applied algebra, formula rearrangement, proportional reasoning, graphs/data, and multi-step application. Not junior-school recall.",
@@ -454,6 +478,8 @@ async def generate_quiz(difficulty="easy", worded_problem=False):
         raw = await ask_ai(
             "You are an accurate science and mathematics assessment writer. Return ONLY valid JSON with string fields topic, question, answer, explanation. "
             "The answer must be correct and the explanation must show clear step-by-step reasoning, including formulas, substitutions, units and the final result when relevant. "
+            "IMPORTANT: This will be displayed in a Discord embed, which does NOT render LaTeX. Write all maths in readable plain text, for example: s_y = u_y*t + 0.5*g*t^2; t = sqrt(45.0/4.905) ≈ 3.03 s. "
+            "Never use dollar signs for maths, $$, \frac, \text, or other LaTeX commands. Use normal Discord Markdown only for bold text and lists. Use clear numbered steps separated by new lines. "
             "Questions must be unambiguous and genuinely match the specified academic level. Do not simplify to junior-school recall. Do not include markdown fences or extra text.",
             f"Generate one original question. Academic level: {difficulty}. Requirements: {level}. Style: {style} "
             "Check the reasoning, arithmetic and units independently. Make the question and answer self-contained."
@@ -464,7 +490,8 @@ async def generate_quiz(difficulty="easy", worded_problem=False):
             topic = item["topic"].strip()
             question = item["question"].strip()
             answer = item["answer"].strip()
-            explanation = item["explanation"].strip()
+            answer = format_discord_explanation(item["answer"])
+            explanation = format_discord_explanation(item["explanation"])
         except (json.JSONDecodeError, KeyError, AttributeError, TypeError):
             continue
         if question and answer and explanation and not is_seen("quizzes", question):
@@ -579,13 +606,13 @@ class QuizButtons(discord.ui.View):
 
     @discord.ui.button(label="Show answer", style=discord.ButtonStyle.primary)
     async def show_answer(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = discord.Embed(title="Answer", description=self.answer[:4000], color=discord.Color.green())
+        embed = discord.Embed(title="Answer", description=format_discord_explanation(self.answer)[:4000], color=discord.Color.green())
         embed.set_footer(text=f"Stellar Science Quiz • {self.topic.title()}")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="Explain", style=discord.ButtonStyle.secondary)
     async def explain(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = discord.Embed(title="Explanation", description=self.explanation[:4000], color=discord.Color.blurple())
+        embed = discord.Embed(title="Explanation", description=format_discord_explanation(self.explanation)[:4000], color=discord.Color.blurple())
         embed.set_footer(text=f"Stellar Science Quiz • {self.topic.title()}")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
