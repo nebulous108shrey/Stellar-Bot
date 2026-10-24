@@ -355,26 +355,45 @@ def is_seen(kind, text):
 # ==================================================
 
 async def ask_ai(system_prompt, user_prompt):
+    """Call Groq with a fallback model and retry if a model returns no text."""
     if ai is None:
         raise RuntimeError(
             "GROQ_API_KEY is missing from .env. Add your API key to enable AI."
         )
 
-    response = await ai.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.7,
-        max_tokens=850,
-    )
+    # Keep a fast, broadly available fallback in case the primary model returns
+    # an empty completion or is temporarily unavailable.
+    models_to_try = [MODEL, "llama-3.1-8b-instant"]
+    errors = []
+    for model_name in models_to_try:
+        try:
+            response = await ai.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.4,
+                max_completion_tokens=3000,
+            )
+            if not response.choices:
+                errors.append(f"{model_name}: no choices returned")
+                continue
+            message = response.choices[0].message
+            content = message.content
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+            finish_reason = getattr(response.choices[0], "finish_reason", "unknown")
+            reasoning = getattr(message, "reasoning", None)
+            errors.append(
+                f"{model_name}: empty content (finish_reason={finish_reason}, "
+                f"reasoning_present={bool(reasoning)})"
+            )
+        except Exception as error:
+            errors.append(f"{model_name}: {type(error).__name__}: {error}")
+            continue
 
-    content = response.choices[0].message.content
-    if not content:
-        raise RuntimeError("The AI returned an empty response.")
-
-    return content.strip()
+    raise RuntimeError("All Groq models failed: " + " | ".join(errors))
 
 
 async def generate_fact():
@@ -389,6 +408,7 @@ async def generate_fact():
         )
 
         try:
+            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I)
             item = json.loads(raw)
             topic = item["topic"].strip()
             fact = item["fact"].strip()
@@ -402,36 +422,39 @@ async def generate_fact():
     raise RuntimeError("Could not create an unused fact. Try again shortly.")
 
 
-async def generate_quiz(difficulty="medium"):
+async def generate_quiz(difficulty="easy", worded_problem=False):
     level_descriptions = {
-        "easy": "Year 10 foundations: direct recall and straightforward one-step applications.",
-        "medium": "Year 10 challenge: connect ideas and use two-step reasoning, but do not rely on Year 11/12-only content.",
-        "hard": "Year 12 / VCE level: senior-secondary depth, multi-step reasoning, precise terminology, and VCE-style applications where relevant.",
-        "extra_hard": "Introductory university level: undergraduate concepts and deeper reasoning. Make the question self-contained and state necessary assumptions."
+        "easy": "Australian Year 10 level: applied algebra, formula rearrangement, proportional reasoning, graphs/data, and multi-step application. Not junior-school recall.",
+        "medium": "Australian Year 11 level: senior-secondary concepts, abstract reasoning, multi-step calculations, experimental data, and selecting appropriate methods. Never downgrade to Year 8-10 basics.",
+        "hard": "Australian Year 12 / VCE level: challenging exam-style application, analysis of data, justified conclusions, correct terminology, and multi-step calculations within a plausible Year 12 syllabus.",
+        "extra_hard": "Introductory university undergraduate level: deeper mathematical/scientific reasoning, multi-stage derivations or analysis, and explicit assumptions."
     }
-    level = level_descriptions.get(difficulty, level_descriptions["medium"])
+    level = level_descriptions.get(difficulty, level_descriptions["easy"])
+    style = (
+        "Create a realistic, multi-step WORDED PROBLEM with a scenario, all necessary data and units, and a clear task. It must require interpreting the scenario and applying concepts, not just recalling a fact."
+        if worded_problem else
+        "Create a challenging, self-contained science or maths question. It may involve calculations, conceptual reasoning, or interpreting data, but do not make it a long worded scenario."
+    )
     for _ in range(5):
         raw = await ask_ai(
-            "You create accurate science and maths quiz questions for students. "
-            "Return ONLY JSON with string fields topic, question and answer. "
-            "Questions must be unambiguous, have one clear answer, and match the requested academic level. "
-            "Use correct units and independently verify any calculations.",
-            f"Generate one original science or maths quiz question at this level: {difficulty}. "
-            f"Level requirements: {level}. Avoid repeating questions already used."
+            "You are an accurate science and mathematics assessment writer. Return ONLY valid JSON with string fields topic, question, answer, explanation. "
+            "The answer must be correct and the explanation must show clear step-by-step reasoning, including formulas, substitutions, units and the final result when relevant. "
+            "Questions must be unambiguous and genuinely match the specified academic level. Do not simplify to junior-school recall. Do not include markdown fences or extra text.",
+            f"Generate one original question. Academic level: {difficulty}. Requirements: {level}. Style: {style} "
+            "Check the reasoning, arithmetic and units independently. Make the question and answer self-contained."
         )
-
         try:
+            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I)
             item = json.loads(raw)
             topic = item["topic"].strip()
             question = item["question"].strip()
             answer = item["answer"].strip()
+            explanation = item["explanation"].strip()
         except (json.JSONDecodeError, KeyError, AttributeError, TypeError):
             continue
-
-        if question and answer and not is_seen("quizzes", question):
+        if question and answer and explanation and not is_seen("quizzes", question):
             if await remember("quizzes", question):
-                return topic, question, answer
-
+                return topic, question, answer, explanation
     raise RuntimeError("Could not create an unused quiz. Try again shortly.")
 
 
@@ -450,10 +473,8 @@ async def get_fact():
     return await generate_fact()
 
 
-async def get_quiz(difficulty="medium"):
-    # Generate by the requested level so a Year 10 question is not accidentally
-    # returned for a Year 12 or university-level request.
-    return await generate_quiz(difficulty)
+async def get_quiz(difficulty="easy", worded_problem=False):
+    return await generate_quiz(difficulty, worded_problem)
 
 
 # ==================================================
@@ -524,35 +545,75 @@ async def science(interaction: discord.Interaction):
 # /QUIZ
 # ==================================================
 
-@bot.tree.command(name="quiz", description="Get a science or maths quiz at your chosen level")
-@app_commands.describe(difficulty="Choose the academic level")
+class QuizButtons(discord.ui.View):
+    def __init__(self, owner_id: int, topic: str, answer: str, explanation: str):
+        super().__init__(timeout=600)
+        self.owner_id = owner_id
+        self.topic = topic
+        self.answer = answer
+        self.explanation = explanation
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the person who generated this quiz can reveal its answer or explanation.",
+                ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Show answer", style=discord.ButtonStyle.primary)
+    async def show_answer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(title="Answer", description=self.answer[:4000], color=discord.Color.green())
+        embed.set_footer(text=f"Stellar Science Quiz • {self.topic.title()}")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Explain", style=discord.ButtonStyle.secondary)
+    async def explain(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(title="Explanation", description=self.explanation[:4000], color=discord.Color.blurple())
+        embed.set_footer(text=f"Stellar Science Quiz • {self.topic.title()}")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="quiz", description="Generate a science or maths question at your chosen level")
+@app_commands.describe(
+    difficulty="Academic level: Year 10, Year 11, Year 12/VCE, or university",
+    worded_problem="True for a realistic multi-step worded problem; false for a standard question"
+)
 @app_commands.choices(difficulty=[
-    app_commands.Choice(name="Easy • Year 10 foundations", value="easy"),
-    app_commands.Choice(name="Medium • Year 10 challenge", value="medium"),
+    app_commands.Choice(name="Easy • Year 10", value="easy"),
+    app_commands.Choice(name="Medium • Year 11", value="medium"),
     app_commands.Choice(name="Hard • Year 12 / VCE", value="hard"),
-    app_commands.Choice(name="Extra hard • University level", value="extra_hard"),
+    app_commands.Choice(name="Extra hard • University", value="extra_hard"),
 ])
-async def quiz(interaction: discord.Interaction, difficulty: app_commands.Choice[str]):
+async def quiz(
+    interaction: discord.Interaction,
+    difficulty: app_commands.Choice[str] = None,
+    worded_problem: bool = False,
+):
     await interaction.response.defer(thinking=True)
-
     try:
-        topic, question, answer = await get_quiz(difficulty.value)
+        prefs = get_feature_user(feature_data, interaction.user.id)
+        chosen_difficulty = difficulty.value if difficulty else prefs.get("difficulty", "easy")
+        topic, question, answer, explanation = await get_quiz(chosen_difficulty, worded_problem)
 
+        label = {
+            "easy": "Year 10", "medium": "Year 11",
+            "hard": "Year 12 / VCE", "extra_hard": "University"
+        }.get(chosen_difficulty, "Year 10")
         embed = discord.Embed(
-            title=f"Stellar Science Quiz • {difficulty.name}",
-            description=f"**Topic:** {topic.title()}\\n\\n{question}",
+            title=f"Stellar Science Quiz • {label}",
+            description=f"**Topic:** {topic.title()}\n\n{question}",
             color=discord.Color.blue()
         )
-        embed.add_field(name="Answer", value=f"||{answer}||", inline=False)
         add_topic_image(embed, topic + " " + question)
-        embed.set_footer(text="Try solving it before revealing the spoiler answer.")
-
-        await interaction.followup.send(embed=embed)
-
+        embed.set_footer(text="Solve it first, then use the buttons for a separate answer or explanation message.")
+        view = QuizButtons(interaction.user.id, topic, answer, explanation)
+        await interaction.followup.send(embed=embed, view=view)
     except Exception as error:
-        print(f"/quiz error: {error}")
+        print(f"/quiz error: {type(error).__name__}: {error}")
         await interaction.followup.send(
-            "I couldn't create a quiz right now. Check the bot terminal and try again."
+            "I couldn't create a quiz right now. Please try again shortly; the host logs contain the technical error."
         )
 
 
@@ -777,7 +838,7 @@ async def help_command(interaction: discord.Interaction):
             "`/convert` — convert common units\n"
             "`/define` — define a term\n"
             "`/hint` — get a hint without the full solution\n"
-            "`/practice` — generate an interactive practice question\n"
+            "`/practice` — generate an interactive practice question with separate answer and explanation buttons\n\n"
             "`/flashcard-add` and `/myflashcards` — create and revise your own cards\n"
             "`/studylog` and `/progress` — track study time and progress\n"
             "`/server` — see server information\n"
@@ -835,9 +896,22 @@ def get_feature_user(feature_data, user_id):
         feature_data["users"][key] = {
             "xp": 0,
             "correct_answers": 0,
-            "challenges_completed": 0
+            "challenges_completed": 0,
+            "difficulty": "easy"
         }
+    feature_data["users"][key].setdefault("difficulty", "easy")
     return feature_data["users"][key]
+
+
+# Shared in-memory feature data used by commands that update preferences.
+# Data is also saved to bot_features.json after changes.
+feature_data = load_feature_data()
+
+
+def award_xp(user, amount):
+    """Safely add XP to a user's saved profile."""
+    user["xp"] = max(0, int(user.get("xp", 0))) + max(0, int(amount))
+    return user["xp"]
 
 
 def today_key():
@@ -1442,14 +1516,51 @@ async def hint(interaction: discord.Interaction, subject: str, question: str):
 
 
 # ------------------------------
+# SAVED DIFFICULTY PREFERENCE
+# ------------------------------
+
+@bot.tree.command(name="setdifficulty", description="Save your default quiz and practice difficulty")
+@app_commands.describe(difficulty="Your default level; the easiest option is Year 10")
+@app_commands.choices(difficulty=[
+    app_commands.Choice(name="Easy • Year 10", value="easy"),
+    app_commands.Choice(name="Medium • Year 11", value="medium"),
+    app_commands.Choice(name="Hard • Year 12 / VCE", value="hard"),
+    app_commands.Choice(name="Extra hard • University", value="extra_hard"),
+])
+async def setdifficulty(interaction: discord.Interaction, difficulty: app_commands.Choice[str]):
+    user_data = get_feature_user(feature_data, interaction.user.id)
+    user_data["difficulty"] = difficulty.value
+    save_feature_data(feature_data)
+    await interaction.response.send_message(
+        f"Your default difficulty is now **{difficulty.name}**. Use `/quiz` or `/practice` without choosing a level to use it.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="mydifficulty", description="Show your saved default difficulty")
+async def mydifficulty(interaction: discord.Interaction):
+    user_data = get_feature_user(feature_data, interaction.user.id)
+    labels = {
+        "easy": "Easy • Year 10",
+        "medium": "Medium • Year 11",
+        "hard": "Hard • Year 12 / VCE",
+        "extra_hard": "Extra hard • University"
+    }
+    await interaction.response.send_message(
+        f"Your saved default is **{labels.get(user_data.get('difficulty', 'easy'), 'Easy • Year 10')}**. Change it with `/setdifficulty`.",
+        ephemeral=True
+    )
+
+
+# ------------------------------
 # NEW FEATURE 2: INTERACTIVE PRACTICE QUIZ
 # ------------------------------
 
 DIFFICULTY_LEVELS = {
-    "easy": "Year 10 level: foundational knowledge, direct applications, and one-step calculations.",
-    "medium": "Year 10 level: more challenging Year 10 questions, requiring connected ideas or two-step reasoning. Do not use Year 11/12-only content.",
-    "hard": "Year 12 level: senior-secondary depth, multi-step reasoning, precise terminology, and VCE-style applications where relevant.",
-    "extra_hard": "University introductory level: undergraduate concepts and reasoning. State any advanced assumptions or definitions needed in the question so it remains self-contained."
+    "easy": "Australian Year 10 curriculum standard. Not Year 7-9 recall: use applied algebra, formula rearrangement, proportional reasoning, graphs/data, and multi-step reasoning suitable for Year 10.",
+    "medium": "Australian Year 11 standard. Require senior-secondary reasoning, more complex applications, multi-step calculations, data interpretation and explanations; do not use junior-school questions.",
+    "hard": "Australian Year 12 / VCE exam standard. Include multi-step, syllabus-appropriate application, analysis and justification with correct terminology and units.",
+    "extra_hard": "Introductory university undergraduate standard. Require deeper conceptual/mathematical reasoning and clearly state necessary assumptions."
 }
 
 
@@ -1464,85 +1575,81 @@ class PracticeView(discord.ui.View):
         self.explanation = explanation
         self.difficulty = difficulty
         self.topic = topic
-        self.revealed = False
+        self.answer_revealed = False
+        self.explanation_revealed = False
 
     def make_embed(self):
-        body = "\\n".join(
-            f"**{chr(65 + i)}.** {option}"
-            for i, option in enumerate(self.options)
-        )
+        body = "\n".join(f"**{chr(65 + i)}.** {option}" for i, option in enumerate(self.options))
         embed = discord.Embed(
-            title=f"Practice Quiz • {self.difficulty.replace('_', ' ').title()}",
+            title=f"Practice • {self.difficulty.replace('_', ' ').title()}",
             description=f"**Topic:** {self.topic}\n\n{self.question}\n\n{body}",
             color=discord.Color.blurple()
         )
-        if self.revealed:
-            embed.add_field(
-                name="Answer and explanation",
-                value=(
-                    f"**{chr(65 + self.answer_index)}. {self.options[self.answer_index]}**\n"
-                    f"{self.explanation}"
-                )[:1024],
-                inline=False
-            )
-            embed.set_footer(text="Run /practice to try another question.")
-        else:
-            embed.add_field(
-                name="Ready to check?",
-                value="Try solving it first, then press **Show answer**.",
-                inline=False
-            )
-            embed.set_footer(text="Only the person who started this quiz can use its buttons.")
+        if self.answer_revealed:
+            embed.add_field(name="Correct answer", value=f"**{chr(65 + self.answer_index)}. {self.options[self.answer_index]}**", inline=False)
+        if self.explanation_revealed:
+            embed.add_field(name="Step-by-step explanation", value=self.explanation[:1024], inline=False)
+        if not self.answer_revealed and not self.explanation_revealed:
+            embed.add_field(name="Need help?", value="Use **Show answer** to check, or **Explain** to reveal the reasoning.", inline=False)
+        embed.set_footer(text="Only the person who started this question can use its buttons.")
         return embed
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
-                "This practice quiz belongs to someone else. Run `/practice` to start your own.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("This practice question belongs to someone else. Run `/practice` to start your own.", ephemeral=True)
             return False
         return True
 
     @discord.ui.button(label="Show answer", style=discord.ButtonStyle.primary)
     async def show_answer(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Acknowledge the button interaction first, then edit the original message.
-        # This avoids the interaction failing silently if Discord is slow to respond.
-        if self.revealed:
-            await interaction.response.send_message(
-                "The answer is already shown above.", ephemeral=True
-            )
-            return
+        self.answer_revealed = True
+        button.disabled = True
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
 
-        self.revealed = True
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
-
-        await interaction.response.defer()
-        if interaction.message:
-            await interaction.message.edit(embed=self.make_embed(), view=self)
+    @discord.ui.button(label="Explain", style=discord.ButtonStyle.secondary)
+    async def explain(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.explanation_revealed = True
+        button.disabled = True
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
 
 
-@bot.tree.command(name="practice", description="Generate a multiple-choice quiz at your chosen level")
+@bot.tree.command(name="practice", description="Generate a multiple-choice or worded practice problem")
 @app_commands.describe(
-    topic="Topic to practise, e.g. electricity, genetics, or calculus",
-    difficulty="Choose the academic level"
+    topic="Topic to practise, e.g. electricity, genetics, algebra, or forces",
+    difficulty="Academic level (defaults to your saved preference)",
+    question_type="Choose the style of problem"
 )
 @app_commands.choices(difficulty=[
-    app_commands.Choice(name="Easy • Year 10 foundations", value="easy"),
-    app_commands.Choice(name="Medium • Year 10 challenge", value="medium"),
+    app_commands.Choice(name="Easy • Year 10", value="easy"),
+    app_commands.Choice(name="Medium • Year 11", value="medium"),
     app_commands.Choice(name="Hard • Year 12 / VCE", value="hard"),
-    app_commands.Choice(name="Extra hard • University level", value="extra_hard"),
+    app_commands.Choice(name="Extra hard • University", value="extra_hard"),
+])
+@app_commands.choices(question_type=[
+    app_commands.Choice(name="Mixed", value="mixed"),
+    app_commands.Choice(name="Worded problem", value="worded"),
+    app_commands.Choice(name="Calculation", value="calculation"),
+    app_commands.Choice(name="Conceptual reasoning", value="conceptual"),
 ])
 async def practice(
     interaction: discord.Interaction,
     topic: str,
-    difficulty: app_commands.Choice[str]
+    difficulty: app_commands.Choice[str] = None,
+    question_type: app_commands.Choice[str] = None,
 ):
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
-        level_description = DIFFICULTY_LEVELS[difficulty.value]
+        user_data = get_feature_user(feature_data, interaction.user.id)
+        chosen_difficulty = difficulty.value if difficulty else user_data.get("difficulty", "easy")
+        chosen_type = question_type.value if question_type else "mixed"
+        level_description = DIFFICULTY_LEVELS.get(chosen_difficulty, DIFFICULTY_LEVELS["easy"])
+        type_instructions = {
+            "mixed": "Choose a suitable mix of conceptual, calculation, and real-world worded questions.",
+            "worded": "Make this a realistic word problem: provide a short scenario, all needed information, and a clear question. The student should interpret the scenario and choose a method, not just recall a fact.",
+            "calculation": "Make this calculation-focused, include all needed values and units, and require working.",
+            "conceptual": "Test conceptual reasoning and understanding rather than simple recall."
+        }
+        type_instruction = type_instructions.get(chosen_type, type_instructions["mixed"])
         system_prompt = (
             "You are an accurate science and mathematics assessment writer. "
             "Generate exactly one clear multiple-choice question and return ONLY valid JSON "
@@ -1555,14 +1662,16 @@ async def practice(
         )
         user_prompt = (
             f"Topic: {topic}\n"
-            f"Selected difficulty: {difficulty.value}\n"
+            f"Selected difficulty: {chosen_difficulty}\n"
             f"Academic level requirements: {level_description}\n"
-            "Make a fresh, self-contained question. For Year 12, use senior-secondary depth; "
-            "for university level, test an introductory undergraduate concept and include all "
-            "necessary assumptions in the question."
+            f"Question style: {type_instruction}\n"
+            "Make a fresh, self-contained question. For worded problems, include realistic context, "
+            "all necessary data and units, and a clear task. Check the correct answer and explanation. "
+            "For Year 12, use senior-secondary depth; for university level, test an introductory "
+            "undergraduate concept and include all necessary assumptions."
         )
         raw = await ask_ai(system_prompt, user_prompt)
-        raw = re.sub(r"^```(?:json)?\\s*|\\s*```$", "", raw.strip(), flags=re.I)
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I)
         item = json.loads(raw)
         options = item["options"]
         answer_index = int(item["answer_index"])
@@ -1582,7 +1691,7 @@ async def practice(
             [option.strip() for option in options],
             answer_index,
             item["explanation"].strip(),
-            difficulty.value,
+            chosen_difficulty,
             topic.strip()
         )
         await interaction.followup.send(
@@ -1679,6 +1788,25 @@ async def progress(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+@bot.tree.command(name="botstatus", description="Check whether Stellar Bot's main configuration is ready")
+async def botstatus(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="Stellar Bot • System Check",
+        description="A quick configuration check. This does not reveal any keys or tokens.",
+        color=discord.Color.green() if TOKEN and GUILD_ID and ai is not None else discord.Color.orange()
+    )
+    embed.add_field(name="Discord connection", value="Connected" if bot.is_ready() else "Not ready", inline=True)
+    embed.add_field(name="AI tutor", value="API key configured" if ai is not None else "Missing GROQ_API_KEY", inline=True)
+    embed.add_field(name="Homework channel", value="Configured" if HOMEWORK_CHANNEL_ID else "Not configured (community requests disabled)", inline=False)
+    embed.add_field(name="Fact/quiz history file", value="Present" if DATA_FILE.exists() else "Will be created when first used", inline=True)
+    embed.add_field(name="Feature save file", value="Present" if FEATURES_FILE.exists() else "Will be created when first used", inline=True)
+    embed.set_footer(text="If a command fails, check the terminal output for the exact error.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ==================================================
+# END OF EXTRA FEATURES
+# ==================================================
 # ==================================================
 # END OF EXTRA FEATURES
 # ==================================================
