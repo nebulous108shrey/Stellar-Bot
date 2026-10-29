@@ -617,10 +617,109 @@ class QuizButtons(discord.ui.View):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="quiz", description="Generate a science or maths question at your chosen level")
+async def generate_quiz_set(topic: str, difficulty: str, question_style: str,
+                           example_questions: str, number_questions: int):
+    levels = {
+        "easy": "Australian Year 10 level",
+        "medium": "Australian Year 11 level",
+        "hard": "Australian Year 12 / VCE level",
+        "extra_hard": "introductory university level",
+    }
+    styles = {
+        "mixed": "a balanced mix of conceptual, calculation and application questions",
+        "multiple_choice": "multiple-choice questions with four options and one correct answer",
+        "calculation": "calculation questions with values, units and working",
+        "worded": "realistic multi-step word problems with all necessary information",
+        "short_answer": "short-answer questions requiring a written explanation",
+    }
+    prompt = (
+        f"Create exactly {number_questions} different questions about {topic}. "
+        f"Level: {levels.get(difficulty, levels['easy'])}. Style: {styles.get(question_style, styles['mixed'])}. "
+        f"Examples supplied by the user (use as style/topic guidance, do not copy verbatim): {example_questions or 'None supplied'}. "
+        "Return ONLY valid JSON in this exact structure: {\"questions\":[{\"question\":\"...\",\"answer\":\"...\",\"explanation\":\"...\"}]}. "
+        "Verify correctness, calculations and units. Use Discord Markdown only and plain-text maths, never LaTeX. "
+        "Make each question self-contained and numbered by its position in the array."
+    )
+    raw = await ask_ai(
+        "You are a careful science and maths quiz writer. Follow the requested number and format exactly. "
+        "Return valid JSON only, with no markdown fences or commentary.", prompt
+    )
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I)
+    parsed = json.loads(raw)
+    questions = parsed.get("questions")
+    if not isinstance(questions, list) or len(questions) != number_questions:
+        raise ValueError("AI did not return the requested number of questions")
+    cleaned = []
+    for q in questions:
+        if not all(isinstance(q.get(k), str) and q[k].strip() for k in ("question", "answer", "explanation")):
+            raise ValueError("A generated quiz question was incomplete")
+        cleaned.append({k: format_discord_explanation(q[k]) for k in ("question", "answer", "explanation")})
+    return cleaned
+
+
+class QuizSessionView(discord.ui.View):
+    def __init__(self, owner_id: int, questions: list[dict], duration_minutes: int, topic: str):
+        super().__init__(timeout=3600)
+        self.owner_id = owner_id
+        self.questions = questions
+        self.duration_minutes = duration_minutes
+        self.topic = topic
+        self.timer_started = False
+        self.answers_revealed = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This quiz session belongs to someone else. Start your own with `/quiz`.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Start timer", style=discord.ButtonStyle.success, emoji="⏱️")
+    async def start_timer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.timer_started:
+            await interaction.response.send_message("Your timer has already started.", ephemeral=True)
+            return
+        self.timer_started = True
+        button.disabled = True
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(
+            f"⏱️ Timer started for **{self.duration_minutes} minute(s)**. I'll ping you when time is up.",
+            ephemeral=True
+        )
+        asyncio.create_task(self._timer_finished(interaction.channel))
+
+    async def _timer_finished(self, channel):
+        await asyncio.sleep(self.duration_minutes * 60)
+        if channel:
+            try:
+                user = bot.get_user(self.owner_id)
+                await channel.send(
+                    f"⏰ {user.mention if user else f'<@{self.owner_id}>'} your **{self.duration_minutes}-minute {self.topic} quiz timer is up!**",
+                    allowed_mentions=discord.AllowedMentions(users=True)
+                )
+            except (discord.HTTPException, discord.Forbidden) as error:
+                print(f"Quiz timer notification failed: {error}")
+
+    @discord.ui.button(label="Show answers & explanations", style=discord.ButtonStyle.secondary, emoji="📖")
+    async def show_answers(self, interaction: discord.Interaction, button: discord.ui.Button):
+        blocks = []
+        for i, q in enumerate(self.questions, 1):
+            blocks.append(f"**{i}. Answer**\n{q['answer']}\n\n**Explanation**\n{q['explanation']}")
+        text = "\n\n---\n\n".join(blocks)
+        if len(text) > 3900:
+            text = text[:3850] + "\n\n…The answer key was shortened. Try a smaller quiz for full explanations."
+        embed = discord.Embed(title=f"Answer key • {self.topic}", description=text, color=discord.Color.green())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        button.disabled = True
+
+
+@bot.tree.command(name="quiz", description="Set up a multi-question timed quiz")
 @app_commands.describe(
-    difficulty="Academic level: Year 10, Year 11, Year 12/VCE, or university",
-    worded_problem="True for a realistic multi-step worded problem; false for a standard question"
+    topic="Topic or subject for the quiz",
+    question_style="What kind of questions do you want?",
+    difficulty="Academic level",
+    example_questions="Optional example questions or guidance to match",
+    number_questions="Number of questions (1–8)",
+    duration_minutes="Timer length in minutes (1–180)"
 )
 @app_commands.choices(difficulty=[
     app_commands.Choice(name="Easy • Year 10", value="easy"),
@@ -628,35 +727,50 @@ class QuizButtons(discord.ui.View):
     app_commands.Choice(name="Hard • Year 12 / VCE", value="hard"),
     app_commands.Choice(name="Extra hard • University", value="extra_hard"),
 ])
+@app_commands.choices(question_style=[
+    app_commands.Choice(name="Mixed", value="mixed"),
+    app_commands.Choice(name="Multiple choice", value="multiple_choice"),
+    app_commands.Choice(name="Calculations", value="calculation"),
+    app_commands.Choice(name="Worded problems", value="worded"),
+    app_commands.Choice(name="Short answer", value="short_answer"),
+])
 async def quiz(
     interaction: discord.Interaction,
+    topic: str,
+    question_style: app_commands.Choice[str],
     difficulty: app_commands.Choice[str] = None,
-    worded_problem: bool = False,
+    example_questions: str = None,
+    number_questions: app_commands.Range[int, 1, 8] = 5,
+    duration_minutes: app_commands.Range[int, 1, 180] = 20,
 ):
     await interaction.response.defer(thinking=True)
     try:
         prefs = get_feature_user(feature_data, interaction.user.id)
         chosen_difficulty = difficulty.value if difficulty else prefs.get("difficulty", "easy")
-        topic, question, answer, explanation = await get_quiz(chosen_difficulty, worded_problem)
-
-        label = {
-            "easy": "Year 10", "medium": "Year 11",
-            "hard": "Year 12 / VCE", "extra_hard": "University"
-        }.get(chosen_difficulty, "Year 10")
-        embed = discord.Embed(
-            title=f"Stellar Science Quiz • {label}",
-            description=f"**Topic:** {topic.title()}\n\n{question}",
-            color=discord.Color.blue()
+        questions = await generate_quiz_set(
+            topic.strip(), chosen_difficulty, question_style.value,
+            (example_questions or "")[:1500], number_questions
         )
-        add_topic_image(embed, topic + " " + question)
-        embed.set_footer(text="Solve it first, then use the buttons for a separate answer or explanation message.")
-        view = QuizButtons(interaction.user.id, topic, answer, explanation)
+        level_label = {"easy":"Year 10", "medium":"Year 11", "hard":"Year 12 / VCE", "extra_hard":"University"}.get(chosen_difficulty, "Year 10")
+        body = []
+        for i, q in enumerate(questions, 1):
+            body.append(f"**Question {i}**\n{q['question']}")
+        description = "\n\n".join(body)
+        if len(description) > 3900:
+            description = description[:3850] + "\n\n…Some text was shortened; use fewer questions for longer prompts."
+        embed = discord.Embed(
+            title=f"Stellar Quiz • {topic[:180]}",
+            description=description,
+            color=discord.Color.blurple()
+        )
+        embed.add_field(name="Settings", value=f"**Level:** {level_label}\n**Style:** {question_style.name}\n**Questions:** {len(questions)}\n**Timer:** {duration_minutes} minutes", inline=False)
+        add_topic_image(embed, topic + " " + " ".join(q["question"] for q in questions[:2]))
+        embed.set_footer(text="Start the timer when you're ready. Answers stay hidden until you reveal them.")
+        view = QuizSessionView(interaction.user.id, questions, duration_minutes, topic[:100])
         await interaction.followup.send(embed=embed, view=view)
     except Exception as error:
         print(f"/quiz error: {type(error).__name__}: {error}")
-        await interaction.followup.send(
-            "I couldn't create a quiz right now. Please try again shortly; the host logs contain the technical error."
-        )
+        await interaction.followup.send("I couldn't build that quiz right now. Try fewer questions or check the host logs for the technical error.", ephemeral=True)
 
 
 # ==================================================
@@ -766,12 +880,14 @@ async def homework(
 )
 @app_commands.describe(
     subject="Subject of your question",
-    question="Explain what you need help with"
+    question="Explain what you need help with",
+    image="Optional screenshot/photo of the exact question"
 )
 async def ask_community(
     interaction: discord.Interaction,
     subject: str,
-    question: str
+    question: str,
+    image: discord.Attachment | None = None
 ):
     if not HOMEWORK_CHANNEL_ID:
         await interaction.response.send_message(
@@ -806,7 +922,13 @@ async def ask_community(
         value=interaction.user.mention,
         inline=False
     )
-    add_topic_image(embed, subject + " " + question)
+    if image is not None:
+        if image.content_type not in {"image/png", "image/jpeg", "image/webp"}:
+            await interaction.response.send_message("Please attach a PNG, JPG/JPEG or WEBP image.", ephemeral=True)
+            return
+        embed.set_image(url=image.url)
+    else:
+        add_topic_image(embed, subject + " " + question)
     embed.set_footer(text="Stellar Science Club • Help each other learn!")
 
     try:
@@ -866,7 +988,8 @@ async def help_command(interaction: discord.Interaction):
         description=(
             "`/hello` — say hello\n"
             "`/science` — get a science fact and relevant illustration\n"
-            "`/quiz` — get a science or maths quiz question\n"
+            "`/practice` — public interactive practice question with answer/explanation buttons\n"
+            "`/quiz` — build a multi-question quiz with a timer and answer key\n"
             "`/homework` — ask the AI tutor for step-by-step help\n"
             "`/ask-community` — post a question for members to answer\n"
             "`/flashcards` — revise with interactive flashcards\n"
@@ -880,7 +1003,7 @@ async def help_command(interaction: discord.Interaction):
             "`/convert` — convert common units\n"
             "`/define` — define a term\n"
             "`/hint` — get a hint without the full solution\n"
-            "`/practice` — generate an interactive practice question with separate answer and explanation buttons\n\n"
+            "`/practice` — public interactive practice question with separate answer and explanation buttons\n\n"
             "`/flashcard-add` and `/myflashcards` — create and revise your own cards\n"
             "`/studylog` and `/progress` — track study time and progress\n"
             "`/server` — see server information\n"
@@ -897,7 +1020,7 @@ async def help_command(interaction: discord.Interaction):
 # AI EXPLAINER, STUDY PLANNER AND SCIENCE UTILITIES
 # ==================================================
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 FEATURES_FILE = Path(__file__).with_name("bot_features.json")
@@ -939,9 +1062,11 @@ def get_feature_user(feature_data, user_id):
             "xp": 0,
             "correct_answers": 0,
             "challenges_completed": 0,
-            "difficulty": "easy"
+            "difficulty": "easy",
+            "xp_history": []
         }
     feature_data["users"][key].setdefault("difficulty", "easy")
+    feature_data["users"][key].setdefault("xp_history", [])
     return feature_data["users"][key]
 
 
@@ -951,8 +1076,14 @@ feature_data = load_feature_data()
 
 
 def award_xp(user, amount):
-    """Safely add XP to a user's saved profile."""
-    user["xp"] = max(0, int(user.get("xp", 0))) + max(0, int(amount))
+    """Add XP and record a timestamp so period leaderboards can be calculated."""
+    amount = max(0, int(amount))
+    user["xp"] = max(0, int(user.get("xp", 0))) + amount
+    history = user.setdefault("xp_history", [])
+    if amount:
+        history.append({"amount": amount, "at": datetime.now(MELBOURNE_TZ).isoformat()})
+        # Keep the log bounded while retaining more than a year of typical activity.
+        user["xp_history"] = history[-10000:]
     return user["xp"]
 
 
@@ -1240,24 +1371,72 @@ async def profile(interaction: discord.Interaction, member: discord.Member = Non
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="leaderboard", description="Show the top Stellar Bot XP earners")
-async def leaderboard(interaction: discord.Interaction):
+@bot.tree.command(name="leaderboard", description="Show XP leaders for today, this week, this month or all time")
+@app_commands.describe(period="Choose which time period to rank XP for")
+@app_commands.choices(period=[
+    app_commands.Choice(name="Today", value="today"),
+    app_commands.Choice(name="This week", value="week"),
+    app_commands.Choice(name="This month", value="month"),
+    app_commands.Choice(name="All time", value="all_time"),
+])
+async def leaderboard(interaction: discord.Interaction, period: app_commands.Choice[str] = None):
     data = load_feature_data()
-    users = sorted(
-        data["users"].items(),
-        key=lambda entry: int(entry[1].get("xp", 0)),
-        reverse=True
-    )[:10]
-    if not users:
-        await interaction.response.send_message("No XP has been earned yet. Try `/challenge`!")
+    selected_period = period.value if period else "all_time"
+    now = datetime.now(MELBOURNE_TZ)
+    if selected_period == "today":
+        cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        title_period = "Today"
+    elif selected_period == "week":
+        cutoff = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        title_period = "This Week"
+    elif selected_period == "month":
+        cutoff = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        title_period = "This Month"
+    else:
+        cutoff = None
+        title_period = "All Time"
+
+    scores = []
+    for user_id, stats in data.get("users", {}).items():
+        if selected_period == "all_time":
+            score = int(stats.get("xp", 0))
+        else:
+            score = 0
+            for event in stats.get("xp_history", []):
+                try:
+                    event_time = datetime.fromisoformat(event["at"])
+                    if event_time.tzinfo is None:
+                        event_time = event_time.replace(tzinfo=MELBOURNE_TZ)
+                    if event_time >= cutoff:
+                        score += max(0, int(event.get("amount", 0)))
+                except (KeyError, TypeError, ValueError):
+                    continue
+        if score > 0 or selected_period == "all_time":
+            scores.append((user_id, stats, score))
+    scores.sort(key=lambda row: row[2], reverse=True)
+    scores = scores[:10]
+    if not scores or not any(row[2] > 0 for row in scores):
+        await interaction.response.send_message(f"No XP has been recorded for **{title_period.lower()}** yet. Keep participating to earn XP!")
         return
 
     lines = []
-    for rank, (user_id, stats) in enumerate(users, start=1):
+    for rank, (user_id, stats, score) in enumerate(scores, start=1):
         member = interaction.guild.get_member(int(user_id)) if interaction.guild else None
-        name = member.display_name if member else f"User {user_id}"
-        lines.append(f"**{rank}.** {name} — **{stats.get('xp', 0)} XP**")
-    embed = discord.Embed(title="Stellar Bot Leaderboard", description="\n".join(lines), color=discord.Color.gold())
+        if member is not None:
+            name = member.display_name
+        else:
+            cached_user = bot.get_user(int(user_id))
+            name = cached_user.name if cached_user else None
+            if name is None:
+                try:
+                    fetched = await bot.fetch_user(int(user_id))
+                    name = fetched.name
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError):
+                    name = f"Unknown user ({user_id})"
+        lines.append(f"**{rank}.** {discord.utils.escape_markdown(name)} — **{score} XP**")
+    embed = discord.Embed(title=f"Stellar Bot Leaderboard • {title_period}", description="\n".join(lines), color=discord.Color.gold())
+    if selected_period != "all_time":
+        embed.set_footer(text="Period rankings count XP earned after this leaderboard feature was deployed; older XP cannot be dated retroactively.")
     await interaction.response.send_message(embed=embed)
 
 
@@ -1633,6 +1812,8 @@ class PracticeView(discord.ui.View):
             embed.add_field(name="Step-by-step explanation", value=self.explanation[:1024], inline=False)
         if not self.answer_revealed and not self.explanation_revealed:
             embed.add_field(name="Need help?", value="Use **Show answer** to check, or **Explain** to reveal the reasoning.", inline=False)
+        # Add a topic-relevant illustration when the topic has a known diagram.
+        add_topic_image(embed, self.topic + " " + self.question)
         embed.set_footer(text="Only the person who started this question can use its buttons.")
         return embed
 
@@ -1679,7 +1860,7 @@ async def practice(
     difficulty: app_commands.Choice[str] = None,
     question_type: app_commands.Choice[str] = None,
 ):
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction.response.defer(thinking=True)
     try:
         user_data = get_feature_user(feature_data, interaction.user.id)
         chosen_difficulty = difficulty.value if difficulty else user_data.get("difficulty", "easy")
@@ -1738,15 +1919,13 @@ async def practice(
         )
         await interaction.followup.send(
             embed=view.make_embed(),
-            view=view,
-            ephemeral=True
+            view=view
         )
     except Exception as error:
         print(f"/practice error: {error}")
         await interaction.followup.send(
             "I couldn't generate a practice question. Try again or choose another topic. "
-            "Check the bot terminal for the exact error.",
-            ephemeral=True
+            "Check the host logs for the exact error."
         )
 
 
