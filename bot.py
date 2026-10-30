@@ -38,6 +38,7 @@ except ValueError:
 DATA_FILE = Path(__file__).with_name("bot_data.json")
 MODEL = "qwen/qwen3.8-27b"
 VISION_MODEL = "qwen/qwen3.8-27b"  # Groq vision-capable model for uploaded worksheet images
+BOT_DESCRIPTION = "Your science and maths companion for Stellar Science Club: AI homework help, interactive practice, quizzes, flashcards, daily challenges and study tools."
 
 ai = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 data_lock = asyncio.Lock()
@@ -964,7 +965,7 @@ async def server(interaction: discord.Interaction):
 
     embed = discord.Embed(
         title=guild.name,
-        description="Welcome to Stellar Science Club!",
+        description="Welcome to Stellar Science Club!\n\n" + BOT_DESCRIPTION,
         color=discord.Color.blurple()
     )
     embed.add_field(
@@ -986,6 +987,7 @@ async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(
         title="✨ Stellar Bot Commands",
         description=(
+            BOT_DESCRIPTION + "\n\n" +
             "`/hello` — say hello\n"
             "`/science` — get a science fact and relevant illustration\n"
             "`/practice` — public interactive practice question with answer/explanation buttons\n"
@@ -1002,8 +1004,7 @@ async def help_command(interaction: discord.Interaction):
             "`/periodic-table` — look up an element\n"
             "`/convert` — convert common units\n"
             "`/define` — define a term\n"
-            "`/hint` — get a hint without the full solution\n"
-            "`/practice` — public interactive practice question with separate answer and explanation buttons\n\n"
+            "`/hint` — get a hint without the full solution\n\n"
             "`/flashcard-add` and `/myflashcards` — create and revise your own cards\n"
             "`/studylog` and `/progress` — track study time and progress\n"
             "`/server` — see server information\n"
@@ -1030,7 +1031,7 @@ MELBOURNE_TZ = ZoneInfo("Australia/Melbourne")
 def load_feature_data():
     """Load extra features separately, preserving the existing fact/quiz history."""
     if not FEATURES_FILE.exists():
-        return {"users": {}, "challenge_attempts": {}, "study_plans": {}, "custom_flashcards": {}, "study_logs": {}, "practice_history": {}}
+        return {"users": {}, "challenge_attempts": {}, "study_plans": {}, "custom_flashcards": {}, "study_logs": {}, "practice_history": {}, "daily_challenges": {}, "daily_challenge_history": []}
     try:
         with FEATURES_FILE.open("r", encoding="utf-8") as file:
             saved = json.load(file)
@@ -1040,6 +1041,8 @@ def load_feature_data():
         saved.setdefault("custom_flashcards", {})
         saved.setdefault("study_logs", {})
         saved.setdefault("practice_history", {})
+        saved.setdefault("daily_challenges", {})
+        saved.setdefault("daily_challenge_history", [])
         return saved
     except (OSError, json.JSONDecodeError) as error:
         # Don't silently overwrite a damaged save file.
@@ -1293,24 +1296,114 @@ DAILY_CHALLENGES = [
 ]
 
 
-def get_daily_challenge():
-    # All servers/users see the same question on the same Melbourne date.
+DAILY_DIFFICULTIES = [
+    ("Easy", "Year 10 level: foundational but thoughtful science or maths application."),
+    ("Medium", "Year 11 level: multi-step reasoning and senior-secondary concepts."),
+    ("Hard", "Year 12 / VCE level: challenging application, calculations or data analysis."),
+    ("Extra hard", "Introductory university level: deeper reasoning and multi-stage application."),
+]
+
+
+def daily_challenge_difficulty(date_key):
+    """Rotate difficulty by Melbourne calendar day, independent of bot restarts."""
+    day_number = datetime.fromisoformat(date_key).date().toordinal()
+    return DAILY_DIFFICULTIES[day_number % len(DAILY_DIFFICULTIES)]
+
+
+def challenge_fingerprint(question):
+    normalised = re.sub(r"[^a-z0-9]+", " ", question.lower()).strip()
+    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
+
+
+async def get_daily_challenge():
+    """Return the one shared challenge for today's Melbourne date.
+
+    A challenge is generated once, saved before it is shown, and never reused
+    on a later date. The date key changes at 00:00 Australia/Melbourne time.
+    """
     date = today_key()
-    index = int(hashlib.sha256(date.encode()).hexdigest(), 16) % len(DAILY_CHALLENGES)
-    return DAILY_CHALLENGES[index]
+    async with data_lock:
+        data = load_feature_data()
+        saved_today = data["daily_challenges"].get(date)
+        if saved_today:
+            return saved_today
+
+        difficulty, level_guidance = daily_challenge_difficulty(date)
+        seen = set(data.get("daily_challenge_history", []))
+        # Include the old built-in bank in the exclusion list so migration
+        # cannot accidentally serve one of those questions again.
+        seen.update(challenge_fingerprint(item["question"]) for item in DAILY_CHALLENGES)
+        recent_questions = [entry.get("question", "") for entry in data.get("daily_challenges", {}).values()]
+        recent_questions = [q for q in recent_questions[-120:] if q]
+
+        for attempt in range(8):
+            raw = await ask_ai(
+                "You write accurate, original daily science and mathematics multiple-choice challenges for students. "
+                "Return ONLY valid JSON with fields topic, question, options, answer, explanation. "
+                "options must be an array of exactly four concise strings. answer must be an integer from 0 to 3. "
+                "The explanation must clearly justify the correct answer. Do not use LaTeX; use readable plain text. "
+                "Never repeat a previous question or merely change its numbers. Ensure exactly one option is correct.",
+                f"Create one genuinely new daily challenge. Difficulty: {difficulty}. {level_guidance} "
+                f"Date identifier: {date}. Previously used questions (avoid both exact and close paraphrases): "
+                f"{json.dumps(recent_questions[-80:], ensure_ascii=False)}. Variation attempt: {attempt + 1}. "
+                "Choose a different science or maths area where possible. Check the answer and explanation carefully."
+            )
+            try:
+                raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I)
+                item = json.loads(raw)
+                topic = str(item["topic"]).strip()
+                question = str(item["question"]).strip()
+                options = [str(option).strip() for option in item["options"]]
+                answer_index = int(item["answer"])
+                explanation = format_discord_explanation(item["explanation"])
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError, AttributeError):
+                continue
+
+            fingerprint = challenge_fingerprint(question)
+            if (not topic or not question or len(options) != 4 or
+                    any(not option for option in options) or answer_index not in range(4) or
+                    not explanation or fingerprint in seen):
+                continue
+
+            challenge_item = {
+                "date": date,
+                "topic": topic,
+                "difficulty": difficulty,
+                "question": question,
+                "options": options,
+                "answer": answer_index,
+                "explanation": explanation,
+                "fingerprint": fingerprint,
+            }
+            data["daily_challenges"][date] = challenge_item
+            data["daily_challenge_history"].append(fingerprint)
+            # Keep the complete daily question archive; do not reset it.
+            save_feature_data(data)
+            return challenge_item
+
+        raise RuntimeError("Could not generate a sufficiently original daily challenge. Please try again shortly.")
 
 
 @bot.tree.command(name="challenge", description="Show today's science challenge")
 async def challenge(interaction: discord.Interaction):
-    item = get_daily_challenge()
-    options = "\n".join(f"**{chr(65 + i)}.** {value}" for i, value in enumerate(item["options"]))
-    embed = discord.Embed(
-        title=f"Daily Science Challenge • {today_key()}",
-        description=f"{item['question']}\n\n{options}\n\nSubmit with `/answer`.",
-        color=discord.Color.gold()
-    )
-    embed.set_footer(text="One scored attempt per user per day • Melbourne time")
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.defer(thinking=True)
+    try:
+        item = await get_daily_challenge()
+        options = "\n".join(f"**{chr(65 + i)}.** {value}" for i, value in enumerate(item["options"]))
+        embed = discord.Embed(
+            title=f"Daily Science Challenge • {item['date']}",
+            description=(
+                f"**Topic:** {item['topic']}\n"
+                f"**Difficulty:** {item['difficulty']}\n\n"
+                f"{item['question']}\n\n{options}\n\nSubmit with `/answer`."
+            ),
+            color=discord.Color.gold()
+        )
+        embed.set_footer(text="One scored attempt per user per day • Resets at 00:00 Melbourne time")
+        await interaction.followup.send(embed=embed)
+    except Exception as error:
+        print(f"/challenge error: {type(error).__name__}: {error}")
+        await interaction.followup.send("I couldn't generate today's challenge right now. Please try again shortly.", ephemeral=True)
 
 
 @bot.tree.command(name="answer", description="Submit your answer to today's challenge")
@@ -1321,8 +1414,8 @@ async def challenge(interaction: discord.Interaction):
     app_commands.Choice(name="D", value="D"),
 ])
 async def answer(interaction: discord.Interaction, choice: app_commands.Choice[str]):
-    date = today_key()
-    item = get_daily_challenge()
+    item = await get_daily_challenge()
+    date = item["date"]
     data = load_feature_data()
     user_key = str(interaction.user.id)
     attempt_key = f"{date}:{user_key}"
@@ -2021,7 +2114,7 @@ async def botstatus(interaction: discord.Interaction):
     embed.add_field(name="Homework channel", value="Configured" if HOMEWORK_CHANNEL_ID else "Not configured (community requests disabled)", inline=False)
     embed.add_field(name="Fact/quiz history file", value="Present" if DATA_FILE.exists() else "Will be created when first used", inline=True)
     embed.add_field(name="Feature save file", value="Present" if FEATURES_FILE.exists() else "Will be created when first used", inline=True)
-    embed.set_footer(text="If a command fails, check the terminal output for the exact error.")
+    embed.set_footer(text="Stellar Science Club • Science, maths and learning tools")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
