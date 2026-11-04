@@ -1557,8 +1557,14 @@ async def get_daily_challenge():
                 "You write accurate, original daily science and mathematics multiple-choice challenges for students. "
                 "Return ONLY valid JSON with fields topic, question, options, answer, explanation. "
                 "options must be an array of exactly four concise strings. answer must be an integer from 0 to 3. "
-                "The explanation must clearly justify the correct answer. Do not use LaTeX; use readable plain text. "
-                "Never repeat a previous question or merely change its numbers. Ensure exactly one option is correct.",
+                "The explanation must be a SHORT, polished final solution (normally 2-5 sentences or numbered calculation steps). "
+                "Do NOT reveal chain-of-thought, private deliberation, drafts, alternative answers, or self-corrections. "
+                "Never write phrases such as 'let me re-check', 'wait', 'I will select', 'why did I think', "
+                "'let me re-read', 'I think', or narrate your reasoning process. "
+                "Work out the problem silently before producing the JSON. Verify the arithmetic, units, answer index, "
+                "and that options[answer] exactly matches the final result. The explanation must support that same option. "
+                "Do not use LaTeX; use readable plain text. Never repeat a previous question or merely change its numbers. "
+                "Ensure exactly one option is correct. Return only the final JSON, with no commentary outside it.",
                 f"Create one genuinely new daily challenge. Difficulty: {difficulty}. {level_guidance} "
                 f"Date identifier: {date}. Previously used questions (avoid both exact and close paraphrases): "
                 f"{json.dumps(recent_questions[-80:], ensure_ascii=False)}. Variation attempt: {attempt + 1}. "
@@ -1573,6 +1579,18 @@ async def get_daily_challenge():
                 answer_index = int(item["answer"])
                 explanation = format_discord_explanation(item["explanation"])
             except (json.JSONDecodeError, KeyError, TypeError, ValueError, AttributeError):
+                continue
+
+            # Reject rambling/self-correcting model output rather than showing it to students.
+            forbidden_reasoning = (
+                "let me re-check", "let me recheck", "wait,", "why did i think",
+                "i will select", "i'll select", "let me re-read", "let me reread",
+                "my initial answer", "actually,", "i made a mistake", "thinking step",
+                "chain of thought", "i need to calculate", "let me calculate again",
+            )
+            if (len(explanation) > 900 or
+                    any(phrase in explanation.lower() for phrase in forbidden_reasoning)):
+                print("Daily challenge generation rejected: explanation was rambling or self-correcting.")
                 continue
 
             fingerprint = challenge_fingerprint(question)
