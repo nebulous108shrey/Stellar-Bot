@@ -6,6 +6,7 @@ import re
 import asyncio
 import base64
 from pathlib import Path
+import aiohttp
 
 import discord
 from discord import app_commands
@@ -772,6 +773,98 @@ async def quiz(
     except Exception as error:
         print(f"/quiz error: {type(error).__name__}: {error}")
         await interaction.followup.send("I couldn't build that quiz right now. Try fewer questions or check the host logs for the technical error.", ephemeral=True)
+
+
+# ==================================================
+# /QUOTE — USER-SUBMITTED QUOTE + LIVE IMAGE SEARCH
+# ==================================================
+
+async def search_quote_image(search_term: str):
+    """Search Wikimedia Commons at command time for a related image.
+
+    Returns (thumbnail_url, source_page_url, image_title), or (None, None, None).
+    """
+    api_url = "https://commons.wikimedia.org/w/api.php"
+    params = {
+        "action": "query",
+        "generator": "search",
+        "gsrsearch": search_term,
+        "gsrnamespace": 6,  # File namespace
+        "gsrlimit": 8,
+        "prop": "imageinfo",
+        "iiprop": "url",
+        "iiurlwidth": 1200,
+        "format": "json",
+    }
+    timeout = aiohttp.ClientTimeout(total=12)
+    headers = {"User-Agent": "StellarScienceBot/1.0 (Discord quote command; educational bot)"}
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(api_url, params=params) as response:
+                if response.status != 200:
+                    return None, None, None
+                payload = await response.json(content_type=None)
+
+        pages = payload.get("query", {}).get("pages", {})
+        candidates = list(pages.values())
+        random.shuffle(candidates)
+        for page in candidates:
+            image_info = (page.get("imageinfo") or [{}])[0]
+            image_url = image_info.get("thumburl") or image_info.get("url")
+            source_url = page.get("canonicalurl") or (
+                "https://commons.wikimedia.org/wiki/" + page.get("title", "").replace(" ", "_")
+            )
+            if image_url and image_url.lower().split("?")[0].endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+                return image_url, source_url, page.get("title", "Wikimedia Commons image")
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError):
+        pass
+    return None, None, None
+
+
+@bot.tree.command(name="quote", description="Create a quote card with a related image")
+@app_commands.describe(
+    quote="The quote you want to share",
+    author="Who said it (optional)",
+    image_search="What image to search for (optional; otherwise inferred from the quote)",
+)
+async def quote_command(
+    interaction: discord.Interaction,
+    quote: app_commands.Range[str, 1, 1000],
+    author: app_commands.Range[str, 1, 100] = "",
+    image_search: app_commands.Range[str, 1, 150] = "",
+):
+    await interaction.response.defer(thinking=True)
+
+    # Use the user's image-search hint if provided; otherwise search keywords from the quote.
+    search_term = (image_search.strip() if image_search else quote.strip())
+    # Avoid searching huge quote sentences verbatim; use a compact query for relevance.
+    search_term = re.sub(r"[^\w\s-]", " ", search_term, flags=re.UNICODE)
+    search_term = " ".join(search_term.split()[:8]) or "science astronomy inspiration"
+    image_url, source_url, image_title = await search_quote_image(search_term)
+
+    embed = discord.Embed(
+        title="✦ STELLAR QUOTE ✦",
+        description=f"\u201c{discord.utils.escape_markdown(quote.strip())}\u201d",
+        color=discord.Color.from_rgb(70, 145, 255),
+    )
+    if author.strip():
+        embed.add_field(name="—", value=f"**{discord.utils.escape_markdown(author.strip())}**", inline=False)
+    embed.set_footer(text=f"Shared by {interaction.user.display_name} • Stellar Science Club")
+    if image_url:
+        embed.set_image(url=image_url)
+        embed.add_field(
+            name="Image source",
+            value=f"[View image on Wikimedia Commons]({source_url})",
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="Image search",
+            value=f"Couldn't find an image for **{discord.utils.escape_markdown(search_term)}** right now. The quote is still displayed above.",
+            inline=False,
+        )
+
+    await interaction.followup.send(embed=embed)
 
 
 # ==================================================
