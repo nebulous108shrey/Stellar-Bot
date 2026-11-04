@@ -776,56 +776,176 @@ async def quiz(
 
 
 # ==================================================
-# /QUOTE — USER-SUBMITTED QUOTE + LIVE IMAGE SEARCH
+# /QUOTE — AI-GENERATED, TYPOGRAPHY-OVERLAID QUOTE CARD
 # ==================================================
 
-async def search_quote_image(search_term: str):
-    """Search Wikimedia Commons at command time for a related image.
+from io import BytesIO
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+from openai import OpenAI
 
-    Returns (thumbnail_url, source_page_url, image_title), or (None, None, None).
-    """
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+quote_image_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+
+async def search_quote_image(search_term: str):
+    """Fallback: find a usable photo on Wikimedia Commons."""
     api_url = "https://commons.wikimedia.org/w/api.php"
     params = {
-        "action": "query",
-        "generator": "search",
-        "gsrsearch": search_term,
-        "gsrnamespace": 6,  # File namespace
-        "gsrlimit": 8,
-        "prop": "imageinfo",
-        "iiprop": "url",
-        "iiurlwidth": 1200,
-        "format": "json",
+        "action": "query", "generator": "search", "gsrsearch": search_term,
+        "gsrnamespace": 6, "gsrlimit": 8, "prop": "imageinfo",
+        "iiprop": "url", "iiurlwidth": 1600, "format": "json",
     }
-    timeout = aiohttp.ClientTimeout(total=12)
-    headers = {"User-Agent": "StellarScienceBot/1.0 (Discord quote command; educational bot)"}
+    timeout = aiohttp.ClientTimeout(total=15)
+    headers = {"User-Agent": "StellarScienceBot/1.0 (Discord quote card)"}
     try:
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
             async with session.get(api_url, params=params) as response:
                 if response.status != 200:
-                    return None, None, None
+                    return None, None
                 payload = await response.json(content_type=None)
-
-        pages = payload.get("query", {}).get("pages", {})
-        candidates = list(pages.values())
-        random.shuffle(candidates)
-        for page in candidates:
-            image_info = (page.get("imageinfo") or [{}])[0]
-            image_url = image_info.get("thumburl") or image_info.get("url")
-            source_url = page.get("canonicalurl") or (
+        pages = list(payload.get("query", {}).get("pages", {}).values())
+        random.shuffle(pages)
+        for page in pages:
+            info = (page.get("imageinfo") or [{}])[0]
+            url = info.get("thumburl") or info.get("url")
+            source = info.get("descriptionurl") or (
                 "https://commons.wikimedia.org/wiki/" + page.get("title", "").replace(" ", "_")
             )
-            if image_url and image_url.lower().split("?")[0].endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
-                return image_url, source_url, page.get("title", "Wikimedia Commons image")
+            if url:
+                async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                    async with session.get(url) as image_response:
+                        if image_response.status == 200:
+                            content = await image_response.read()
+                            if content and len(content) < 15_000_000:
+                                return content, source
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError):
         pass
-    return None, None, None
+    return None, None
 
 
-@bot.tree.command(name="quote", description="Create a quote card with a related image")
+def _quote_font(size: int, bold: bool = False):
+    candidates = (
+        ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+         "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+         "C:/Windows/Fonts/arialbd.ttf"]
+        if bold else
+        ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+         "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+         "C:/Windows/Fonts/arial.ttf"]
+    )
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _wrap_quote(draw, text, font, max_width):
+    words = text.split()
+    lines, current = [], ""
+    for word in words:
+        candidate = word if not current else current + " " + word
+        if draw.textbbox((0, 0), candidate, font=font)[2] <= max_width:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines or [""]
+
+
+def _compose_quote_card(background_bytes: bytes, quote: str, author: str, username: str):
+    """Crop image and add sharp, readable quote typography with Pillow."""
+    image = Image.open(BytesIO(background_bytes)).convert("RGB")
+    image = ImageOps.fit(image, (1600, 900), method=Image.Resampling.LANCZOS)
+
+    # Dark gradient panel on the right; keep the generated image visible on the left.
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    for x in range(600, 1600):
+        alpha = int(235 * ((x - 600) / 1000) ** 0.65)
+        od.line((x, 0, x, 900), fill=(3, 7, 16, alpha), width=1)
+    image = Image.alpha_composite(image.convert("RGBA"), overlay)
+    draw = ImageDraw.Draw(image)
+
+    # Elegant accent rule + brand label.
+    draw.rounded_rectangle((1045, 115, 1053, 785), radius=4, fill=(80, 160, 255, 235))
+    draw.text((1090, 125), "✦  STELLAR SCIENCE BOT", font=_quote_font(25, True),
+              fill=(135, 195, 255, 255))
+    draw.text((1080, 165), "“", font=_quote_font(75, True), fill=(110, 175, 255, 230))
+
+    quote = re.sub(r"\s+", " ", quote.strip())
+    max_width, max_height = 430, 470
+    selected_font, lines, line_height = None, None, None
+    for size in range(46, 21, -2):
+        font = _quote_font(size)
+        candidate_lines = _wrap_quote(draw, quote, font, max_width)
+        spacing = int(size * 1.25)
+        if len(candidate_lines) * spacing <= max_height:
+            selected_font, lines, line_height = font, candidate_lines, spacing
+            break
+    if selected_font is None:
+        selected_font = _quote_font(22)
+        lines = _wrap_quote(draw, quote, selected_font, max_width)
+        line_height = 29
+
+    y = 220
+    for line in lines:
+        draw.text((1090, y), line, font=selected_font, fill=(250, 250, 252, 255),
+                  stroke_width=1, stroke_fill=(0, 0, 0, 100))
+        y += line_height
+
+    author_line = f"— {author.strip()}" if author.strip() else f"— {username}"
+    author_y = min(max(y + 30, 720), 790)
+    draw.text((1090, author_y), author_line, font=_quote_font(27, True),
+              fill=(195, 210, 230, 255))
+    draw.text((1090, 835), "STELLAR SCIENCE CLUB  •  QUOTE", font=_quote_font(17, True),
+              fill=(135, 155, 180, 255))
+
+    output = BytesIO()
+    image.convert("RGB").save(output, format="JPEG", quality=91, optimize=True)
+    output.seek(0)
+    return output
+
+
+async def generate_quote_background(quote: str, image_hint: str = ""):
+    """Generate a realistic cinematic image using OpenAI's Images API."""
+    if not quote_image_client:
+        return None
+
+    visual_idea = image_hint.strip() or quote.strip()
+    prompt = (
+        "Generate a highly realistic cinematic photograph to serve as the background "
+        "for a premium quote poster. Visually interpret this theme: " + visual_idea[:450] + ". "
+        "Landscape composition, subject and visual detail mainly in the LEFT half, "
+        "RIGHT half dark and relatively uncluttered for typography to be overlaid later. "
+        "Natural photographic lighting, believable textures and optics, editorial-quality "
+        "photography, subtle deep navy shadows and restrained blue highlights. "
+        "No words, text, letters, logos, watermark, collage, or graphic-design elements."
+    )
+
+    def _generate():
+        response = quote_image_client.images.generate(
+            model="gpt-image-2.5-flare", prompt=prompt, size="1536x1024",
+            quality="medium", n=1, output_format="jpeg",
+        )
+        return base64.b64decode(response.data[0].b64_json)
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_generate), timeout=150)
+    except Exception as exc:
+        print(f"[QUOTE IMAGE GEN ERROR] {type(exc).__name__}: {exc}")
+        return None
+
+
+@bot.tree.command(name="quote", description="Create a cinematic quote card with an AI-generated image")
 @app_commands.describe(
     quote="The quote you want to share",
     author="Who said it (optional)",
-    image_search="What image to search for (optional; otherwise inferred from the quote)",
+    image_search="Describe the visual scene you want (optional)",
 )
 async def quote_command(
     interaction: discord.Interaction,
@@ -834,37 +954,40 @@ async def quote_command(
     image_search: app_commands.Range[str, 1, 150] = "",
 ):
     await interaction.response.defer(thinking=True)
+    quote, author, scene_hint = quote.strip(), author.strip(), image_search.strip()
 
-    # Use the user's image-search hint if provided; otherwise search keywords from the quote.
-    search_term = (image_search.strip() if image_search else quote.strip())
-    # Avoid searching huge quote sentences verbatim; use a compact query for relevance.
-    search_term = re.sub(r"[^\w\s-]", " ", search_term, flags=re.UNICODE)
-    search_term = " ".join(search_term.split()[:8]) or "science astronomy inspiration"
-    image_url, source_url, image_title = await search_quote_image(search_term)
+    # Always try AI first. Wikimedia is only a fallback if AI generation fails.
+    background = await generate_quote_background(quote, scene_hint)
+    image_source = None
+    if background is None:
+        search_term = re.sub(r"[^\w\s-]", " ", scene_hint or quote, flags=re.UNICODE)
+        search_term = " ".join(search_term.split()[:8]) or "cinematic landscape"
+        background, image_source = await search_quote_image(search_term)
 
-    embed = discord.Embed(
-        title="✦ STELLAR QUOTE ✦",
-        description=f"\u201c{discord.utils.escape_markdown(quote.strip())}\u201d",
-        color=discord.Color.from_rgb(70, 145, 255),
-    )
-    if author.strip():
-        embed.add_field(name="—", value=f"**{discord.utils.escape_markdown(author.strip())}**", inline=False)
+    if background is None:
+        await interaction.followup.send(
+            "I couldn't create or retrieve a background. Check that `OPENAI_API_KEY` "
+            "is configured and valid on the bot host."
+        )
+        return
+
+    try:
+        card = await asyncio.to_thread(
+            _compose_quote_card, background, quote, author, interaction.user.display_name
+        )
+    except Exception as exc:
+        print(f"[QUOTE CARD COMPOSE ERROR] {type(exc).__name__}: {exc}")
+        await interaction.followup.send("Couldn't compose the quote card. Check host logs.")
+        return
+
+    file = discord.File(card, filename="stellar_quote.jpg")
+    embed = discord.Embed(title="✦ Stellar Science Bot • Quote ✦",
+                          color=discord.Color.from_rgb(70, 145, 255))
+    embed.set_image(url="attachment://stellar_quote.jpg")
     embed.set_footer(text=f"Shared by {interaction.user.display_name} • Stellar Science Club")
-    if image_url:
-        embed.set_image(url=image_url)
-        embed.add_field(
-            name="Image source",
-            value=f"[View image on Wikimedia Commons]({source_url})",
-            inline=False,
-        )
-    else:
-        embed.add_field(
-            name="Image search",
-            value=f"Couldn't find an image for **{discord.utils.escape_markdown(search_term)}** right now. The quote is still displayed above.",
-            inline=False,
-        )
-
-    await interaction.followup.send(embed=embed)
+    if image_source:
+        embed.description = f"[Fallback background source]({image_source})"
+    await interaction.followup.send(embed=embed, file=file)
 
 
 # ==================================================
